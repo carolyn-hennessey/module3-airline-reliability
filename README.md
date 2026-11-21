@@ -85,3 +85,19 @@ Setup: `pip install pandas pyarrow scikit-learn pyyaml joblib google-cloud-stora
 Airport delay history from `daily_airport_stats.csv` (yesterday and trailing-7-day delay and cancel rates for origin and destination, 30 extra columns) was tried and removed: it lifted test AUC only from 0.70 to 0.72 and R² from 0.13 to 0.16, not enough to justify the added dimensionality.
 
 Delays remain hard to predict from schedule information alone (day-of weather and aircraft rotation are not in the features), so treat the model as a risk ranking rather than a precise delay estimate.
+
+
+## Experiment Tracking (MLflow)
+Experiments are tracked with MLflow in `experiments/`, separately from the pipeline: `pipeline/pipeline.py` is unchanged and has no MLflow dependency.
+
+- `experiments/track_experiments.py` imports the pipeline's building blocks (GCS download, chronological split, model, evaluation), so each tracked run is identical to a normal pipeline run. It then logs, per run: the model parameters, split and data settings, train/validation/test metrics (log-scale RMSE/MAE/R², MAE in minutes, ROC AUC), the baseline RMSE, the fitted model, and the resolved config.
+- `experiments/experiments.yaml` lists the runs. Each run is a name plus dotted-path overrides of `pipeline/config.yaml` (e.g. `model.learning_rate: 0.05`), so adding an experiment means adding a few lines of YAML. It also sets the MLflow experiment name and storage locations.
+- Run metadata is stored in `experiments/mlflow.db` (SQLite) and models in `experiments/mlartifacts/`; both are git-ignored.
+
+```
+pip install mlflow
+python experiments/track_experiments.py
+mlflow ui --backend-store-uri sqlite:///experiments/mlflow.db   # then open http://localhost:5000
+```
+
+The six default runs (learning rate, tree size and regularization variations) all land within 0.004 of each other on test ROC AUC (0.701-0.704), so the model is insensitive to these hyperparameters and the baseline config is fine.

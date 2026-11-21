@@ -3,3 +3,6 @@ __pycache__
 data/processed/
 data/gcs/
 pipeline/artifacts/
+experiments/mlflow.db
+experiments/mlartifacts/
+mlruns/

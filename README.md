@@ -101,3 +101,36 @@ mlflow ui --backend-store-uri sqlite:///experiments/mlflow.db   # then open http
 ```
 
 The six default runs (learning rate, tree size and regularization variations) all land within 0.004 of each other on test ROC AUC (0.701-0.704), so the model is insensitive to these hyperparameters and the baseline config is fine.
+
+
+## Prediction API (FastAPI)
+`api/main.py` serves the trained model. It loads `pipeline/artifacts/model.joblib` once at startup (override the location with the `MODEL_PATH` environment variable), so run `python pipeline/pipeline.py` first.
+
+```
+pip install fastapi uvicorn
+uvicorn api.main:app --reload      # interactive docs at http://127.0.0.1:8000/docs
+```
+
+**`POST /predict`** takes raw flight details and applies the same feature engineering used in training (`engineer_features` in `preprocessing/preprocess.py`, shared so there is no train/serve skew):
+
+```
+curl -X POST http://127.0.0.1:8000/predict -H "Content-Type: application/json" -d '{
+  "airline_code": "DL", "flight_date": "2026-07-04",
+  "origin": "ATL", "dest": "JFK", "sched_dep_time": 1745
+}'
+```
+```
+{"predicted_delay_minutes": 7.6, "predicted_log_delay_minutes": 2.1492, "airline": "Delta Air Lines"}
+```
+
+| Field | Notes |
+|---|---|
+| `airline_code` | IATA code, must appear in `airlines.csv` (case-insensitive) |
+| `flight_date` | `YYYY-MM-DD` |
+| `origin`, `dest` | IATA codes from `airports.csv`; must differ |
+| `sched_dep_time` | local time as HHMM, 0-2359 (e.g. `1745`) |
+| `distance` | optional miles; estimated from airport coordinates if omitted |
+
+Invalid or unknown inputs return HTTP 422 with an explanation. `GET /health` reports whether the model is loaded.
+
+The response is the model's expected delay in minutes (`expm1` of the log-scale prediction, floored at 0). It is a risk-ranking estimate, not a calibrated probability, and predictions are typically small because most flights have little or no delay.

@@ -75,6 +75,55 @@ def explore(frames: dict[str, pd.DataFrame]) -> None:
     print("daily-stats airports not in airports.csv:", len(set(ds["airport"]) - known))
 
 
+def haversine_miles(lat1, lon1, lat2, lon2):
+    """Great-circle distance in statute miles."""
+    lat1, lon1, lat2, lon2 = map(np.radians, (lat1, lon1, lat2, lon2))
+    h = np.sin((lat2 - lat1) / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2
+    return 3958.8 * 2 * np.arcsin(np.sqrt(h))
+
+
+def engineer_features(fl: pd.DataFrame, airports: pd.DataFrame) -> pd.DataFrame:
+    """Add every model feature to a table of flights (also used by the API at prediction time).
+
+    Required columns: flight_date (datetime), airline_code, origin, dest, sched_dep_time (HHMM int).
+    Optional: distance (miles); if absent it is estimated from airport coordinates.
+    Only information known before departure is used.
+    """
+    fl = fl.copy()
+    # --- date features ---
+    d = fl["flight_date"]
+    fl["month"] = d.dt.month
+    fl["day_of_week"] = d.dt.dayofweek + 1  # ISO: Monday=1 ... Sunday=7 (matches the raw data)
+    fl["day_of_month"] = d.dt.day
+    fl["week_of_year"] = d.dt.isocalendar().week.astype(int)
+    fl["is_weekend"] = d.dt.dayofweek.isin([5, 6]).astype(int)
+    holidays = USFederalHolidayCalendar().holidays(d.min() - pd.Timedelta(days=7), d.max() + pd.Timedelta(days=7))
+    nearest = np.abs(d.values[:, None].astype("datetime64[D]") - holidays.values[None, :].astype("datetime64[D]")).min(axis=1)
+    fl["days_to_nearest_holiday"] = nearest.astype("timedelta64[D]").astype(int)
+    fl["near_holiday"] = (fl["days_to_nearest_holiday"] <= 2).astype(int)
+
+    # --- scheduled departure time (HHMM integer, known in advance) ---
+    fl["sched_dep_hour"] = fl["sched_dep_time"] // 100
+    fl["sched_dep_minutes"] = fl["sched_dep_hour"] * 60 + fl["sched_dep_time"] % 100
+    angle = 2 * np.pi * fl["sched_dep_minutes"] / (24 * 60)  # cyclical: 23:59 is next to 00:00
+    fl["sched_dep_sin"], fl["sched_dep_cos"] = np.sin(angle), np.cos(angle)
+
+    # --- airport features (origin_ / dest_ prefixed) ---
+    ap = airports[["iata_code", "latitude", "longitude", "elevation_ft", "airport_type", "departures"]]
+    for side, col in [("origin", "origin"), ("dest", "dest")]:
+        renamed = ap.rename(columns={c: f"{side}_{c}" for c in ap.columns if c != "iata_code"}).rename(columns={"iata_code": col})
+        fl = fl.merge(renamed, on=col, how="left", validate="m:1")
+    # Airport volume is heavy-tailed too (3 to 573k departures): log-transform
+    for side in ("origin", "dest"):
+        fl[f"log_{side}_departures"] = np.log1p(fl.pop(f"{side}_departures"))
+    if "distance" not in fl:
+        fl["distance"] = haversine_miles(fl["origin_latitude"], fl["origin_longitude"], fl["dest_latitude"], fl["dest_longitude"])
+    fl["log_distance"] = np.log1p(fl["distance"])
+    fl["route"] = fl["origin"] + "-" + fl["dest"]
+
+    return fl
+
+
 def build_training_set(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Build a flight-level modeling table from airline, date and airport information.
 
@@ -95,32 +144,7 @@ def build_training_set(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
     fl["log_delay_minutes"] = np.log1p(fl["delay_minutes"])
     fl["is_delayed"] = (fl["delay_minutes"] >= DELAY_THRESHOLD_MIN).astype(int)
 
-    # --- date features ---
-    d = fl["flight_date"]
-    fl["day_of_month"] = d.dt.day
-    fl["week_of_year"] = d.dt.isocalendar().week.astype(int)
-    fl["is_weekend"] = d.dt.dayofweek.isin([5, 6]).astype(int)
-    holidays = USFederalHolidayCalendar().holidays(d.min() - pd.Timedelta(days=7), d.max() + pd.Timedelta(days=7))
-    nearest = np.abs(d.values[:, None].astype("datetime64[D]") - holidays.values[None, :].astype("datetime64[D]")).min(axis=1)
-    fl["days_to_nearest_holiday"] = nearest.astype("timedelta64[D]").astype(int)
-    fl["near_holiday"] = (fl["days_to_nearest_holiday"] <= 2).astype(int)
-
-    # --- scheduled departure time (HHMM integer, known in advance) ---
-    fl["sched_dep_hour"] = fl["sched_dep_time"] // 100
-    fl["sched_dep_minutes"] = fl["sched_dep_hour"] * 60 + fl["sched_dep_time"] % 100
-    angle = 2 * np.pi * fl["sched_dep_minutes"] / (24 * 60)  # cyclical: 23:59 is next to 00:00
-    fl["sched_dep_sin"], fl["sched_dep_cos"] = np.sin(angle), np.cos(angle)
-
-    # --- airport features (origin_ / dest_ prefixed) ---
-    ap = frames["airports"][["iata_code", "latitude", "longitude", "elevation_ft", "airport_type", "departures"]]
-    for side, col in [("origin", "origin"), ("dest", "dest")]:
-        renamed = ap.rename(columns={c: f"{side}_{c}" for c in ap.columns if c != "iata_code"}).rename(columns={"iata_code": col})
-        fl = fl.merge(renamed, on=col, how="left", validate="m:1")
-    # Airport volume is heavy-tailed too (3 to 573k departures): log-transform
-    for side in ("origin", "dest"):
-        fl[f"log_{side}_departures"] = np.log1p(fl.pop(f"{side}_departures"))
-    fl["log_distance"] = np.log1p(fl["distance"])
-    fl["route"] = fl["origin"] + "-" + fl["dest"]
+    fl = engineer_features(fl, frames["airports"])
 
     features = [
         "flight_date", "airline_code", "origin", "dest", "route",

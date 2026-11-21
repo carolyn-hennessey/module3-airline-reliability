@@ -41,3 +41,19 @@ All flight-level data covers **2025-01-01 to 2026-08-31**. Keys are consistent a
 - **Non-contiguous US airports:** `airports.csv` includes territories (latitudes down to -14, longitudes up to +145), which may need handling for geographic features.
 - **Leakage risk:** `arr_delay`, `arr_del15`, the delay-cause columns, `cancelled` and `diverted` are only known after a flight, so they must be excluded from features when predicting reliability in advance.
 
+
+
+## Training Set Preprocessing
+`preprocessing/preprocess.py` also builds the modeling table (`build_training_set`) and writes `data/processed/train.parquet` and `data/processed/test.parquet` (git-ignored; regenerate with `python preprocessing/preprocess.py`). It currently reads `flights_sample.csv` and will use the full `flights` data if it is loaded.
+
+- **Unit and filtering:** one row per flight. Cancelled and diverted flights are dropped (they have no delay minutes), leaving 489,636 rows.
+- **Target:** `delay_minutes` is the worse of departure and arrival delay, clipped at 0, so any delay cause counts. 52% of flights have zero delay minutes. `is_delayed` flags 15+ minutes (27.2% of flights).
+- **Log transform:** the raw target is extremely right-skewed (skewness 10.9). `log_delay_minutes = log1p(delay_minutes)` brings skewness to 0.76 and is the recommended regression target. Predictions can be mapped back with `expm1`. `distance` (1.4 to -0.35) and airport volume are also log-transformed.
+- **Features (all known before departure):**
+  - Airline and route: `airline_code`, `origin`, `dest`, `route`
+  - Date: `month`, `day_of_week`, `day_of_month`, `week_of_year`, `is_weekend`, `days_to_nearest_holiday`, `near_holiday`
+  - Distance: `distance`, `log_distance`
+  - Airport attributes from `airports.csv`: latitude, longitude, elevation, airport type, log departure volume
+- **Excluded to avoid leakage:** actual times, taxi/air time, arrival fields and the delay-cause columns. Scheduled departure time is not included because the model is specified in terms of airline, date and airports, but it is a strong predictor (9% late before 6am vs 33% at 8pm) and worth adding later.
+- **Split:** time-based, so the model is tested on data later than anything it trained on. Train is 2025-01-01 to 2026-05-31 (413,112 rows) and test is 2026-06-01 to 2026-08-31 (76,524 rows).
+- **Still to do at modeling time:** one-hot or target-encode the categorical columns (`route` has high cardinality). Four test-set origins (ERI, LNS, DJT, HEZ) never appear in train, so the encoder must handle unseen categories.

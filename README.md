@@ -52,8 +52,36 @@ All flight-level data covers **2025-01-01 to 2026-08-31**. Keys are consistent a
 - **Features (all known before departure):**
   - Airline and route: `airline_code`, `origin`, `dest`, `route`
   - Date: `month`, `day_of_week`, `day_of_month`, `week_of_year`, `is_weekend`, `days_to_nearest_holiday`, `near_holiday`
+  - Scheduled departure time: `sched_dep_hour`, `sched_dep_minutes` (since midnight), and `sched_dep_sin`/`sched_dep_cos` (cyclical, so 23:59 sits next to 00:00)
   - Distance: `distance`, `log_distance`
   - Airport attributes from `airports.csv`: latitude, longitude, elevation, airport type, log departure volume
-- **Excluded to avoid leakage:** actual times, taxi/air time, arrival fields and the delay-cause columns. Scheduled departure time is not included because the model is specified in terms of airline, date and airports, but it is a strong predictor (9% late before 6am vs 33% at 8pm) and worth adding later.
+- **Excluded to avoid leakage:** actual times, taxi/air time, arrival fields and the delay-cause columns.
 - **Split:** time-based, so the model is tested on data later than anything it trained on. Train is 2025-01-01 to 2026-05-31 (413,112 rows) and test is 2026-06-01 to 2026-08-31 (76,524 rows).
 - **Still to do at modeling time:** one-hot or target-encode the categorical columns (`route` has high cardinality). Four test-set origins (ERI, LNS, DJT, HEZ) never appear in train, so the encoder must handle unseen categories.
+- **Upload to GCS:** the last step of `preprocess.py` uploads `train.parquet` and `test.parquet` to `gs://aipi50_module3_chennessey_training_data/`. It uses Application Default Credentials, so set up access first:
+  1. Install the Google Cloud CLI (`gcloud`): on macOS run `brew install --cask gcloud-cli`, or follow https://cloud.google.com/sdk/docs/install for other platforms. Confirm with `gcloud --version`.
+  2. Run `gcloud auth application-default login` and sign in with an account that can write to the bucket. (Alternatively, set `GOOGLE_APPLICATION_CREDENTIALS` to a service-account key file.)
+  3. Re-run `python preprocessing/preprocess.py`. Without credentials the script still writes the local files, then exits with a message.
+
+
+## Model Pipeline
+`pipeline/pipeline.py` trains and evaluates the delay model. Run it from the repo root with `python pipeline/pipeline.py` (optionally `--config <path>`). Every tunable parameter lives in `pipeline/config.yaml`.
+
+1. **Ingestion:** downloads `train.parquet` and `test.parquet` from `gs://aipi50_module3_chennessey_training_data/` into `data/gcs/` (git-ignored; files already present are reused unless `force_download: true`). This needs the same `gcloud` setup described under Training Set Preprocessing.
+2. **Feature engineering:** done in the preprocessing step (`preprocessing/preprocess.py`): date and holiday features, log transforms and the `log_delay_minutes` target. The pipeline only adds model-specific encoding: one-hot for airline and airport type, and cross-fitted target encoding for the high-cardinality `origin`, `dest` and `route`. Unseen airports and routes fall back to the global mean.
+3. **Split:** the provided test set is the later time period. The validation set is the most recent `split.validation_fraction` (default 15%) of the training data, so train, validation and test run in chronological order.
+4. **Model:** scikit-learn `HistGradientBoostingRegressor` on `log_delay_minutes`, with `learning_rate`, `max_iter`, tree size and regularization set in `config.yaml`.
+5. **Evaluation:** RMSE/MAE/R² on the log scale, MAE in real minutes (after `expm1`), and ROC AUC of the predicted delay against `is_delayed`, on train, validation and test, plus a predict-the-mean baseline. Metrics are saved to `pipeline/artifacts/metrics.json` and the model to `pipeline/artifacts/model.joblib`.
+
+Setup: `pip install pandas pyarrow scikit-learn pyyaml joblib google-cloud-storage`.
+
+**Results** (data built from `flights_sample.csv`; test = Jun-Aug 2026): test RMSE on the log scale is 1.68 vs 1.81 for the predict-the-mean baseline, R² is 0.13, MAE is about 24 minutes (median absolute error 5 minutes), and ROC AUC for delay likelihood is 0.70.
+
+| Feature set | Test AUC | Test R² (log) |
+|---|---|---|
+| Airline, date, airports | 0.60 | 0.04 |
+| + scheduled departure time | 0.70 | 0.13 |
+
+Airport delay history from `daily_airport_stats.csv` (yesterday and trailing-7-day delay and cancel rates for origin and destination, 30 extra columns) was tried and removed: it lifted test AUC only from 0.70 to 0.72 and R² from 0.13 to 0.16, not enough to justify the added dimensionality.
+
+Delays remain hard to predict from schedule information alone (day-of weather and aircraft rotation are not in the features), so treat the model as a risk ranking rather than a precise delay estimate.

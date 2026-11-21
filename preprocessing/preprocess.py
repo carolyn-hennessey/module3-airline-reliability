@@ -11,6 +11,7 @@ from pandas.tseries.holiday import USFederalHolidayCalendar
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 PROCESSED_DIR = DATA_DIR / "processed"
 DELAY_THRESHOLD_MIN = 15  # DOT definition of a "delayed" flight
+GCS_BUCKET = "aipi50_module3_chennessey_training_data"
 TEST_START = "2026-06-01"  # time-based split: train before, test from this date on
 
 
@@ -82,7 +83,7 @@ def build_training_set(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
     recommended regression target because delays are heavily right-skewed; `is_delayed`
     (>= 15 min) is kept for evaluating delay likelihood. Cancelled and diverted flights have
     no delay minutes and are dropped. Only information known before departure is used as
-    features (airline, date, origin/destination, route distance, airport attributes); no
+    features (airline, date, scheduled departure time, origin/destination, route distance, airport attributes); no
     post-flight columns or delay-cause columns are kept.
     """
     fl = frames["flights_sample"]
@@ -104,6 +105,12 @@ def build_training_set(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
     fl["days_to_nearest_holiday"] = nearest.astype("timedelta64[D]").astype(int)
     fl["near_holiday"] = (fl["days_to_nearest_holiday"] <= 2).astype(int)
 
+    # --- scheduled departure time (HHMM integer, known in advance) ---
+    fl["sched_dep_hour"] = fl["sched_dep_time"] // 100
+    fl["sched_dep_minutes"] = fl["sched_dep_hour"] * 60 + fl["sched_dep_time"] % 100
+    angle = 2 * np.pi * fl["sched_dep_minutes"] / (24 * 60)  # cyclical: 23:59 is next to 00:00
+    fl["sched_dep_sin"], fl["sched_dep_cos"] = np.sin(angle), np.cos(angle)
+
     # --- airport features (origin_ / dest_ prefixed) ---
     ap = frames["airports"][["iata_code", "latitude", "longitude", "elevation_ft", "airport_type", "departures"]]
     for side, col in [("origin", "origin"), ("dest", "dest")]:
@@ -119,6 +126,7 @@ def build_training_set(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
         "flight_date", "airline_code", "origin", "dest", "route",
         "month", "day_of_week", "day_of_month", "week_of_year", "is_weekend",
         "days_to_nearest_holiday", "near_holiday",
+        "sched_dep_hour", "sched_dep_minutes", "sched_dep_sin", "sched_dep_cos",
         "distance", "log_distance",
         "origin_latitude", "origin_longitude", "origin_elevation_ft", "origin_airport_type", "log_origin_departures",
         "dest_latitude", "dest_longitude", "dest_elevation_ft", "dest_airport_type", "log_dest_departures",
@@ -150,6 +158,42 @@ def save_training_set(df: pd.DataFrame) -> None:
     print(f"saved to {PROCESSED_DIR}")
 
 
+def gcs_client():
+    """GCS client using Application Default Credentials.
+
+    `gcloud auth application-default login` creds carry a quota project but no default
+    project, which storage.Client() rejects, so fall back to the credentials' quota project.
+    """
+    import google.auth
+    from google.cloud import storage
+
+    creds, project = google.auth.default()
+    project = project or getattr(creds, "quota_project_id", None)
+    return storage.Client(project=project, credentials=creds)
+
+
+def upload_to_gcs(bucket_name: str = GCS_BUCKET) -> None:
+    """Upload the processed train/test files to GCS (final preprocessing step).
+
+    Uses Application Default Credentials; authenticate first with
+    `gcloud auth application-default login` (or set GOOGLE_APPLICATION_CREDENTIALS).
+    """
+    from google.auth.exceptions import DefaultCredentialsError
+
+    try:
+        bucket = gcs_client().bucket(bucket_name)
+    except DefaultCredentialsError as e:
+        raise SystemExit(
+            f"GCS upload skipped: no Google credentials found ({e}).\n"
+            "Run `gcloud auth application-default login` and re-run; local files in "
+            f"{PROCESSED_DIR} were already written."
+        )
+    for name in ("train.parquet", "test.parquet"):
+        blob = bucket.blob(name)
+        blob.upload_from_filename(PROCESSED_DIR / name)
+        print(f"uploaded {name} -> gs://{bucket_name}/{name}")
+
+
 if __name__ == "__main__":
     pd.set_option("display.width", 200)
     frames = load_raw()
@@ -159,3 +203,4 @@ if __name__ == "__main__":
     print("nulls:", training.isna().sum()[lambda x: x > 0].to_dict() or "none")
     report_skew(training)
     save_training_set(training)
+    upload_to_gcs()

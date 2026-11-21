@@ -1,0 +1,57 @@
+# Control parameters for pipeline/pipeline.py
+
+data:
+  gcs_bucket: aipi50_module3_chennessey_training_data
+  train_blob: train.parquet
+  test_blob: test.parquet
+  local_dir: data/gcs          # where downloaded files are stored (git-ignored)
+  force_download: false        # re-download even if the files already exist locally
+
+features:
+  target: log_delay_minutes    # regression target (log1p of delay minutes), created in preprocessing
+  binary_target: is_delayed    # used only to score delay likelihood (ROC AUC)
+  # Low-cardinality categoricals -> one-hot
+  onehot: [airline_code, origin_airport_type, dest_airport_type]
+  # High-cardinality categoricals -> cross-fitted target encoding
+  target_encode: [origin, dest, route]
+  numeric:
+    - month
+    - day_of_week
+    - day_of_month
+    - week_of_year
+    - is_weekend
+    - days_to_nearest_holiday
+    - near_holiday
+    - sched_dep_hour
+    - sched_dep_minutes
+    - sched_dep_sin
+    - sched_dep_cos
+    - log_distance
+    - origin_latitude
+    - origin_longitude
+    - origin_elevation_ft
+    - log_origin_departures
+    - dest_latitude
+    - dest_longitude
+    - dest_elevation_ft
+    - log_dest_departures
+
+split:
+  # Validation set is carved from the END of the training data (chronological),
+  # so validation, like test, is later in time than what the model trains on.
+  validation_fraction: 0.15
+
+model:
+  type: hist_gradient_boosting
+  learning_rate: 0.1
+  max_iter: 300
+  max_depth: null
+  max_leaf_nodes: 31
+  min_samples_leaf: 50
+  l2_regularization: 1.0
+  early_stopping: true         # uses an internal split; the validation set above is for reporting
+  random_state: 42
+
+output:
+  model_path: pipeline/artifacts/model.joblib
+  metrics_path: pipeline/artifacts/metrics.json

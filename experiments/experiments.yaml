@@ -1,0 +1,24 @@
+# Settings for experiments/track_experiments.py (MLflow tracking).
+# The model/feature/split defaults come from pipeline/config.yaml; this file only
+# controls how runs are tracked and which parameter variations to try.
+
+mlflow:
+  tracking_uri: sqlite:///experiments/mlflow.db   # run metadata (git-ignored)
+  artifact_root: experiments/mlartifacts          # models and files per run (git-ignored)
+  experiment_name: airline-delay-regression
+
+# Each entry is one run. Keys are dotted paths into pipeline/config.yaml and override it.
+# An empty dict {} is the config.yaml baseline.
+runs:
+  - name: baseline
+    overrides: {}
+  - name: lr-0.05
+    overrides: {model.learning_rate: 0.05}
+  - name: lr-0.2
+    overrides: {model.learning_rate: 0.2}
+  - name: leaves-15
+    overrides: {model.max_leaf_nodes: 15}
+  - name: leaves-63
+    overrides: {model.max_leaf_nodes: 63}
+  - name: strong-l2
+    overrides: {model.l2_regularization: 10.0}

@@ -6,7 +6,7 @@ View results:            mlflow ui --backend-store-uri sqlite:///experiments/mlf
 pipeline/pipeline.py is unchanged and has no MLflow dependency. This script imports its
 building blocks (GCS download, split, model, evaluation) so runs are identical to a normal
 pipeline run, applies the parameter variations from experiments/experiments.yaml, and logs
-each one to MLflow: parameters, metrics for train/validation/test, and the fitted model.
+each one to MLflow: parameters, metrics for train/validation/test, diagnostic plots and the fitted model.
 """
 import argparse
 import copy
@@ -14,8 +14,12 @@ import sys
 import tempfile
 from pathlib import Path
 
-import mlflow
-import mlflow.sklearn
+import matplotlib
+
+matplotlib.use("Agg")  # headless backend (works in containers)
+import matplotlib.pyplot as plt  # noqa: E402
+import mlflow  # noqa: E402
+import mlflow.sklearn  # noqa: E402
 import numpy as np
 import pandas as pd
 import yaml
@@ -38,6 +42,31 @@ def apply_overrides(cfg: dict, overrides: dict) -> dict:
             raise KeyError(f"override '{dotted}' does not exist in pipeline/config.yaml")
         node[leaf] = value
     return cfg
+
+
+def log_plots(model, test: pd.DataFrame, cfg: dict, columns: list[str]) -> None:
+    """Log diagnostic plots for the test set as run artifacts."""
+    target = cfg["features"]["target"]
+    actual, pred = test[target].to_numpy(), model.predict(test[columns])
+    lim = max(actual.max(), pred.max())
+
+    fig, ax = plt.subplots(figsize=(5.5, 5))
+    hb = ax.hexbin(pred, actual, gridsize=40, bins="log", cmap="viridis", mincnt=1)
+    ax.plot([0, lim], [0, lim], "r--", lw=1, label="perfect prediction")
+    ax.set(xlabel="predicted log(1 + delay minutes)", ylabel="actual log(1 + delay minutes)", title="Test set: predicted vs actual")
+    ax.legend(loc="upper left")
+    fig.colorbar(hb, label="flights (log scale)")
+    fig.tight_layout()
+    mlflow.log_figure(fig, "plots/test_pred_vs_actual.png")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.hist(actual - pred, bins=60, color="tab:blue")
+    ax.axvline(0, color="r", ls="--", lw=1)
+    ax.set(xlabel="residual (actual - predicted, log scale)", ylabel="flights", title="Test set residuals")
+    fig.tight_layout()
+    mlflow.log_figure(fig, "plots/test_residuals.png")
+    plt.close(fig)
 
 
 def log_run(name: str, cfg: dict, train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame, columns: list[str]) -> None:
@@ -66,6 +95,8 @@ def log_run(name: str, cfg: dict, train: pd.DataFrame, val: pd.DataFrame, test: 
 
         # MLflow's safe (skops) serializer flags this sklearn type; we trained the model
         # ourselves, so trusting exactly this one type is safe.
+        log_plots(model, test, cfg, columns)
+
         mlflow.sklearn.log_model(
             model, name="model",
             skops_trusted_types=["sklearn.ensemble._hist_gradient_boosting.predictor.TreePredictor"],

@@ -1,0 +1,11 @@
+# Runtime dependencies for the prediction API (api/main.py).
+# scikit-learn, numpy and pandas are pinned to the versions the model was trained and pickled with.
+fastapi==0.162.5
+uvicorn==0.54.0
+pydantic==2.14.4
+pandas==2.3.3
+numpy==2.2.6
+scikit-learn==1.7.2
+scipy==1.15.3
+joblib==1.6.0
+PyYAML==6.0.4

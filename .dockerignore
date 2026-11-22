@@ -1,0 +1,10 @@
+# Keep the build context small: allow only what the Dockerfile copies.
+*
+!requirements-api.txt
+!api/
+!preprocessing/preprocess.py
+!pipeline/config.yaml
+!pipeline/artifacts/model.joblib
+!data/airports.csv
+!data/airlines.csv
+**/__pycache__

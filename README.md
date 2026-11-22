@@ -134,3 +134,44 @@ curl -X POST http://127.0.0.1:8000/predict -H "Content-Type: application/json" -
 Invalid or unknown inputs return HTTP 422 with an explanation. `GET /health` reports whether the model is loaded.
 
 The response is the model's expected delay in minutes (`expm1` of the log-scale prediction, floored at 0). It is a risk-ranking estimate, not a calibrated probability, and predictions are typically small because most flights have little or no delay.
+
+
+## Deploying the API (Docker and Google Cloud Run)
+The `Dockerfile` packages the API with the trained model baked into the image. It uses `python:3.10-slim`, installs the pinned `requirements-api.txt` (versions match the environment the model was pickled in), copies only the files the API needs, runs as a non-root user, and listens on the `PORT` that Cloud Run provides (default 8080). `.dockerignore` keeps the build context to those files.
+
+Train first, because the image copies `pipeline/artifacts/model.joblib` (git-ignored):
+```
+python pipeline/pipeline.py
+```
+
+Test locally:
+```
+docker build -t airline-delay-api .
+docker run --rm -p 8080:8080 airline-delay-api
+curl http://localhost:8080/health
+```
+
+Deploy to Cloud Run (requires the `gcloud` CLI from the GCS setup above):
+```
+gcloud run deploy airline-delay-api --source . --project project-4364f816-1535-4389-aef --region us-central1 --memory 1Gi
+```
+`--source .` builds the image with Cloud Build using `.gcloudignore`, which mirrors `.dockerignore` so the model file is included even though git ignores it. Add `--allow-unauthenticated` only if the API should be publicly callable. Otherwise callers need an identity token. To retrain and redeploy, re-run the pipeline and the deploy command.
+
+
+## Front End (Streamlit)
+`frontend/app.py` is a one-page form that calls the deployed API (`POST /predict`). The user picks an airline, origin airport, destination airport, flight date and scheduled departure time, and the page shows the predicted delay in minutes. It also validates that origin and destination differ and shows the API's error message if a call fails.
+
+It is self-contained: `frontend/airports.csv` and `frontend/airlines.csv` hold the dropdown options (copied from `data/`), and `frontend/requirements.txt` lists its dependencies.
+
+Run locally from the repo root:
+```
+pip install -r frontend/requirements.txt
+streamlit run frontend/app.py
+```
+
+The API URL defaults to the Cloud Run service (`https://airline-delay-api-170279949235.us-east1.run.app`). To point at a different backend (for example `http://localhost:8080`), set `API_URL` in `.streamlit/secrets.toml` locally (git-ignored) or in the app's **Secrets** settings on Streamlit Community Cloud:
+```
+API_URL = "https://your-service-url"
+```
+
+**Deploying on Streamlit Community Cloud:** push the repo to GitHub, then at https://share.streamlit.io choose **Create app**, select the repo and branch, set the main file path to `frontend/app.py`, and deploy. Streamlit installs `frontend/requirements.txt` automatically. The Cloud Run service must allow unauthenticated requests, since the front end calls it without credentials. The first request after the API has been idle can take a few seconds while Cloud Run starts a container.

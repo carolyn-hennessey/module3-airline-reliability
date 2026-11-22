@@ -1,0 +1,15 @@
+# Used by `gcloud run deploy --source .` / Cloud Build (git-style rules). Unlike .dockerignore,
+# do NOT start with "*": that would also drop the Dockerfile and files inside excluded folders.
+# Anything not listed here IS uploaded, including git-ignored pipeline/artifacts/model.joblib.
+.git/
+.gitignore
+.venv/
+**/__pycache__/
+experiments/
+mlruns/
+data/gcs/
+data/processed/
+data/weather/
+data/flights_sample.csv
+data/daily_airport_stats.csv
+data/flights.parquet

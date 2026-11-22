@@ -6,3 +6,4 @@ pipeline/artifacts/
 experiments/mlflow.db
 experiments/mlartifacts/
 mlruns/
+.streamlit/secrets.toml

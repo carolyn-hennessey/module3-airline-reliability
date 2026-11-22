@@ -5,7 +5,8 @@
 .gitignore
 .venv/
 **/__pycache__/
-experiments/
+experiments/mlflow.db
+experiments/mlartifacts/
 mlruns/
 data/gcs/
 data/processed/

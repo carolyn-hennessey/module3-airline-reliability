@@ -1,177 +1,112 @@
-# Predicting Airline Reliability 
+# Predicting Airline Reliability
 
-## Navigating the Repo
-`/data` contains the original source data in 5 files:
-1. `data/airlines.csv` aggregates delay and cancellation data at the airline level
-2. `data/airports.csv` aggregates delay and cancellation data at the airport level
-3. `data/daily_airport_stats.csv` provides a daily snapshot of flight delay/cancellation/departure aggregates by day by airport
-4. `data/flights_sample.csv` contains the dataset of departure/delay/cancellatio data aggregated at the level of the individual flights
+How late could my flight be? This project trains a regression model on roughly 500,000 US domestic flights (Jan 2025 - Aug 2026) to predict the delay of a flight using pre-departure data: the airline, the date, the scheduled departure time and the two airports. The model is served through a FastAPI HTTP backend hosted in GCP Cloud Run and easily interfaced using a Streamlit Community Cloud hosted frontend with a small web form.
 
+## Live services
+- [API SwaggerUI](https://airline-delay-api-170279949235.us-east1.run.app/docs)
+- [Front end](https://aipi51-module3-airline-reliability-carolynh.streamlit.app/) ([deployment steps](frontend/README.md))
 
-## Source Data Analysis
-Initial exploratory analysis lives in `preprocessing/preprocess.py`, which loads each raw file in `/data` into a pandas DataFrame and prints summaries (run `python preprocessing/preprocess.py` from the repo root).
+**Model Type:** regression. Due to the large number of row, the ScikitLearn `HistGradientBoostingRegressor` was selected, specifically.  **Target:** `log1p(delay minutes)`, where delay is the larger of a flight's departure and arrival delay, floored at 0. **Evaluation:** RMSE on the log scale (against a predict-the-mean baseline), plus ROC AUC of the predicted delay against "delayed 15+ minutes" as an easier-to-read ranking metric. Ultimately, this model performs only subtly better than always esitmating the mean value of `log1p(delay minutes)` due to the low frequency of this event (roughly 23% of all flights were delayed), but since the goal of this project was not to train the best model, this poor performance was accepted.
 
-### Dataset overview
-| File | Rows x Cols | Grain | Notes |
+## Project Overview
+
+```
+data/*.csv ──► preprocessing ──► GCS bucket ──► pipeline ──► model.joblib ──► API (Cloud Run) ◄── Streamlit app
+ (raw)        EDA + features     train/test     train +        in the          FastAPI          (Community Cloud)
+                                  parquet       evaluate       Docker image
+                                                    │
+                                          experiments (MLflow tracking)
+```
+
+## Reproducing each module
+Each module has its own README with setup and run instructions. Run them in this order, always from the repo root.
+
+| Step | Module | What it does | Instructions |
 |---|---|---|---|
-| `airlines.csv` | 14 x 7 | airline | ~11.7M total flights; no nulls or duplicates |
-| `airports.csv` | 361 x 11 | airport | 99 large, 259 medium, 3 small; 52 states/territories; no nulls |
-| `daily_airport_stats.csv` | 202,872 x 13 | airport-day | 361 airports; (date, airport) is unique |
-| `flights_sample.csv` | 500,000 x 40 | flight | ~4% sample of the full flight-level data |
+| 1 | `preprocessing/` | Explores the raw data, engineers features, builds train/test sets and uploads them to GCS | [preprocessing/README.md](preprocessing/README.md) |
+| 2 | `pipeline/` | Downloads the data from GCS, trains and evaluates the model | [pipeline/README.md](pipeline/README.md) |
+| 3 | `experiments/` | Tracks and compares model variations with MLflow | [experiments/README.md](experiments/README.md) |
+| 4 | `api/` (+ `Dockerfile`) | FastAPI backend serving the model; Docker and Cloud Run deployment | [api/README.md](api/README.md) |
+| 5 | `frontend/` | Streamlit form that calls the API | [frontend/README.md](frontend/README.md) |
 
-All flight-level data covers **2025-01-01 to 2026-08-31**. Keys are consistent across files: every airline code and every origin/destination airport in the flight sample and daily stats appears in `airlines.csv` / `airports.csv`.
+Cloud setup (installing `gcloud` and signing in) is described once, in the [preprocessing README](preprocessing/README.md). Install the Python dependencies with `pip install -r requirements.txt` (Python 3.10). Alternatively, the root `Dockerfile` runs training and serving in a container (`docker run IMAGE train` / `serve`; see the [pipeline](pipeline/README.md#train-inside-docker) and [API](api/README.md) READMEs).
 
-### Key findings
-- **Overall reliability (flight sample):** 22.7% of flights depart 15+ minutes late, 22.8% arrive 15+ minutes late, 1.8% are cancelled and 0.3% are diverted.
-- **Airline differences are meaningful.** Arrival-delay rates range from 17.3% (Hawaiian) to ~28% (Frontier, PSA). Cancellation rates range from 0.6% (Allegiant) to 4.9% (PSA) and 4.2% (Republic). Large carriers like Delta, United and Alaska sit near 20-22% late arrivals.
-- **Delays have strong time patterns.**
-  - Time of day: 9% late for departures before 6am, rising steadily to ~33% in the 8-9pm block.
-  - Season: peaks in June/July (27-29%) and December (27%); lowest in September (17%).
-  - Day of week: Sunday (26%) and Monday (25%) are worst; Tuesday (19%) and Wednesday (20%) are best.
-- **Delay causes** (share of delay minutes on delayed flights): late-arriving aircraft 39%, carrier 33%, NAS 21%, weather 7%, security <1%. Weather, however, drives most cancellations (5,720 of 8,884 cancelled flights in the sample).
-- **Daily airport stats** are highly skewed: median airport-day has 9 scheduled departures (max 1,161), and `dep_delay_mean` ranges from -65 to 1,614 minutes, so small-airport days are noisy.
+## The data
+**Source:** [Kaggle: US Flight Delays & Cancellations 2025-2026](https://www.kaggle.com/datasets/samuelpombourcq/us-flight-delays-and-cancellations-2025-2026)
 
-### Data quality notes and caveats
-- **Structural nulls, not errors.** ~1.8-2.1% of flight-level timing/delay fields are null because the flight was cancelled or diverted. The five delay-cause columns (`carrier_delay`, etc.) are null for 77.7% of rows - i.e. any flight that was not 15+ minutes late - and should be filled with 0 or handled explicitly. `cancellation_code`/`cancellation_reason` are null for the 98.2% of flights that were not cancelled.
-- **Daily stats nulls:** ~0.4% of airport-days have null delay rates (all flights cancelled that day).
-- **Possible label oddities:** 398 cancelled flights in the sample still have a `dep_time` (likely cancelled after pushback), and one flight has a non-positive `sched_elapsed_time`.
-- **Heavy-tailed delays:** `dep_delay` and `arr_delay` reach 3,400+ minutes, so use robust statistics or clip when modeling.
-- **Time fields are HHMM integers** (e.g. `25` = 00:25, `2400` appears in actuals) rather than timestamps and need conversion.
-- **Incomplete airline coverage:** Hawaiian's last flight is 2025-12-31 and Spirit's is 2026-05-01 (the other 12 run through 2026-08-31), so these carriers have shorter histories.
-- **Non-contiguous US airports:** `airports.csv` includes territories (latitudes down to -14, longitudes up to +145), which may need handling for geographic features.
-- **Leakage risk:** `arr_delay`, `arr_del15`, the delay-cause columns, `cancelled` and `diverted` are only known after a flight, so they must be excluded from features when predicting reliability in advance.
+The raw files in `data/` cover US domestic flights from 2025-01-01 to 2026-08-31:
+
+| File | Grain | Rows | Used for |
+|---|---|---|---|
+| `flights_sample.csv` | one row per flight | 500,000 (~4% sample of ~11.7M flights) | Training and test data |
+| `airports.csv` | one row per airport | 361 | Airport attributes (location, elevation, type, volume) |
+| `airlines.csv` | one row per airline | 14 | Airline names and validation |
+| `daily_airport_stats.csv` | one row per airport per day | 202,872 | Explored; airport history features were tried and dropped due to large increase in dimensionality and low AUC lift |
 
 
+What the exploration found, in brief (full detail in the [preprocessing README](preprocessing/README.md)):
+- About 23% of flights arrive 15+ minutes late, 1.8% are cancelled and 0.3% are diverted.
+- Delays vary a lot by airline (17% to 28% late), by time of day (9% before 6am vs 33% at 8pm), by season (summer and December worst) and by day of week.
+- Delay minutes are extremely right-skewed, and 52% of flights have no delay at all.
+- Late-arriving aircraft (39%) and carrier problems (33%) cause most delay minutes; weather causes most cancellations.
 
-## Training Set Preprocessing
-`preprocessing/preprocess.py` also builds the modeling table (`build_training_set`) and writes `data/processed/train.parquet` and `data/processed/test.parquet` (git-ignored; regenerate with `python preprocessing/preprocess.py`). It currently reads `flights_sample.csv` and will use the full `flights` data if it is loaded.
+## The model
+- **Task:** regression. The target is the larger of a flight's departure and arrival delay, floored at zero, so any cause of delay counts. Cancelled and diverted flights are excluded because they have no delay minutes.
+- **Target transform:** the target is modeled as `log1p(delay minutes)`, which cuts skewness from 10.9 to 0.76. Predictions are converted back to minutes with `expm1`.
+- **Features (all known before departure):** airline, origin, destination, route, date and holiday features, scheduled departure time (encoded cyclically), distance and airport attributes. Post-flight columns are excluded to avoid leakage.
+- **Algorithm:** scikit-learn `HistGradientBoostingRegressor`: a simple, fast tree ensemble that copes with skewed data, mixed feature types and missing values. High-cardinality categoricals (origin, destination, route) use cross-fitted target encoding; airline and airport type are one-hot encoded.
+- **Evaluation:** a time-based split. Train is Jan 2025 - May 2026, with the last 15% of it held out for validation, and test is Jun - Aug 2026, so the model is always scored on flights later than anything it trained on.
 
-- **Unit and filtering:** one row per flight. Cancelled and diverted flights are dropped (they have no delay minutes), leaving 489,636 rows.
-- **Target:** `delay_minutes` is the worse of departure and arrival delay, clipped at 0, so any delay cause counts. 52% of flights have zero delay minutes. `is_delayed` flags 15+ minutes (27.2% of flights).
-- **Log transform:** the raw target is extremely right-skewed (skewness 10.9). `log_delay_minutes = log1p(delay_minutes)` brings skewness to 0.76 and is the recommended regression target. Predictions can be mapped back with `expm1`. `distance` (1.4 to -0.35) and airport volume are also log-transformed.
-- **Features (all known before departure):**
-  - Airline and route: `airline_code`, `origin`, `dest`, `route`
-  - Date: `month`, `day_of_week`, `day_of_month`, `week_of_year`, `is_weekend`, `days_to_nearest_holiday`, `near_holiday`
-  - Scheduled departure time: `sched_dep_hour`, `sched_dep_minutes` (since midnight), and `sched_dep_sin`/`sched_dep_cos` (cyclical, so 23:59 sits next to 00:00)
-  - Distance: `distance`, `log_distance`
-  - Airport attributes from `airports.csv`: latitude, longitude, elevation, airport type, log departure volume
-- **Excluded to avoid leakage:** actual times, taxi/air time, arrival fields and the delay-cause columns.
-- **Split:** time-based, so the model is tested on data later than anything it trained on. Train is 2025-01-01 to 2026-05-31 (413,112 rows) and test is 2026-06-01 to 2026-08-31 (76,524 rows).
-- **Still to do at modeling time:** one-hot or target-encode the categorical columns (`route` has high cardinality). Four test-set origins (ERI, LNS, DJT, HEZ) never appear in train, so the encoder must handle unseen categories.
-- **Upload to GCS:** the last step of `preprocess.py` uploads `train.parquet` and `test.parquet` to `gs://aipi50_module3_chennessey_training_data/`. It uses Application Default Credentials, so set up access first:
-  1. Install the Google Cloud CLI (`gcloud`): on macOS run `brew install --cask gcloud-cli`, or follow https://cloud.google.com/sdk/docs/install for other platforms. Confirm with `gcloud --version`.
-  2. Run `gcloud auth application-default login` and sign in with an account that can write to the bucket. (Alternatively, set `GOOGLE_APPLICATION_CREDENTIALS` to a service-account key file.)
-  3. Re-run `python preprocessing/preprocess.py`. Without credentials the script still writes the local files, then exits with a message.
-
-
-## Model Pipeline
-`pipeline/pipeline.py` trains and evaluates the delay model. Run it from the repo root with `python pipeline/pipeline.py` (optionally `--config <path>`). Every tunable parameter lives in `pipeline/config.yaml`.
-
-1. **Ingestion:** downloads `train.parquet` and `test.parquet` from `gs://aipi50_module3_chennessey_training_data/` into `data/gcs/` (git-ignored; files already present are reused unless `force_download: true`). This needs the same `gcloud` setup described under Training Set Preprocessing.
-2. **Feature engineering:** done in the preprocessing step (`preprocessing/preprocess.py`): date and holiday features, log transforms and the `log_delay_minutes` target. The pipeline only adds model-specific encoding: one-hot for airline and airport type, and cross-fitted target encoding for the high-cardinality `origin`, `dest` and `route`. Unseen airports and routes fall back to the global mean.
-3. **Split:** the provided test set is the later time period. The validation set is the most recent `split.validation_fraction` (default 15%) of the training data, so train, validation and test run in chronological order.
-4. **Model:** scikit-learn `HistGradientBoostingRegressor` on `log_delay_minutes`, with `learning_rate`, `max_iter`, tree size and regularization set in `config.yaml`.
-5. **Evaluation:** RMSE/MAE/R² on the log scale, MAE in real minutes (after `expm1`), and ROC AUC of the predicted delay against `is_delayed`, on train, validation and test, plus a predict-the-mean baseline. Metrics are saved to `pipeline/artifacts/metrics.json` and the model to `pipeline/artifacts/model.joblib`.
-
-Setup: `pip install pandas pyarrow scikit-learn pyyaml joblib google-cloud-storage`.
-
-**Results** (data built from `flights_sample.csv`; test = Jun-Aug 2026): test RMSE on the log scale is 1.68 vs 1.81 for the predict-the-mean baseline, R² is 0.13, MAE is about 24 minutes (median absolute error 5 minutes), and ROC AUC for delay likelihood is 0.70.
-
-| Feature set | Test AUC | Test R² (log) |
+| Feature set | Test ROC AUC (delayed 15+ min) | Test R² (log scale) |
 |---|---|---|
 | Airline, date, airports | 0.60 | 0.04 |
-| + scheduled departure time | 0.70 | 0.13 |
+| + scheduled departure time (final model) | **0.70** | **0.13** |
+| + 30 airport delay-history features (not kept) | 0.72 | 0.16 |
 
-Airport delay history from `daily_airport_stats.csv` (yesterday and trailing-7-day delay and cancel rates for origin and destination, 30 extra columns) was tried and removed: it lifted test AUC only from 0.70 to 0.72 and R² from 0.13 to 0.16, not enough to justify the added dimensionality.
+The final model has a log-scale test RMSE of 1.68 against 1.81 for always predicting the mean, with a median absolute error of about 5 minutes. Delays are hard to predict from schedule information alone, since weather and aircraft rotation aren't known in advance.
 
-Delays remain hard to predict from schedule information alone (day-of weather and aircraft rotation are not in the features), so treat the model as a risk ranking rather than a precise delay estimate.
+## Decision Record
 
+Here I would note that most of my decisions were driven by past experience and ergonomics where relevant (GCP, FastAPI and Streamlit).
 
-## Experiment Tracking (MLflow)
-Experiments are tracked with MLflow in `experiments/`, separately from the pipeline: `pipeline/pipeline.py` is unchanged and has no MLflow dependency.
+| Decision | Choice | Why |
+|---|---|---|
+| Cloud provider | **Google Cloud Platform** | One provider for the whole path: **Cloud Storage** hands the training and test sets from preprocessing to the pipeline, **Cloud Build** builds the container, and **Cloud Run** serves the API. Cloud Run scales to zero, so the API costs nothing while idle. |
+| Experiment tracking | **MLflow** | Open source and runs locally with no server (SQLite plus a local artifact folder). It records the parameters, metrics and model of every run so variations can be compared. It lives in `experiments/`, separate from the pipeline, so training has no dependency on it. |
+| Backend | **FastAPI** | Typed request validation (bad airlines, airports and times return clear 422 errors), automatic interactive docs at `/docs`, and a very small amount of code. It reuses the training feature code, so there's no train/serve skew. |
+| Front end | **Streamlit on Community Cloud** | A form page is a few dozen lines of Python, and Community Cloud hosts it free straight from the GitHub repo. It calls the Cloud Run API over HTTP, so the two deploy independently. |
+| Model choice | Large dataset with regression problem-type | I did not spend much time on this since it was noted as not the point of the assignment. Simple, fast to train. |
+| Airport delay-history features | Tried, then dropped | They raised test AUC only from 0.70 to 0.72 while adding 30 columns, which didn't justify the extra complexity per our previous Module. |
+| Containerized model | Model baked into the Docker image | The simplest deployment: the image is self-contained and starts fast. |
 
-- `experiments/track_experiments.py` imports the pipeline's building blocks (GCS download, chronological split, model, evaluation), so each tracked run is identical to a normal pipeline run. It then logs, per run: the model parameters, split and data settings, train/validation/test metrics (log-scale RMSE/MAE/R², MAE in minutes, ROC AUC), the baseline RMSE, the fitted model, and the resolved config.
-- `experiments/experiments.yaml` lists the runs. Each run is a name plus dotted-path overrides of `pipeline/config.yaml` (e.g. `model.learning_rate: 0.05`), so adding an experiment means adding a few lines of YAML. It also sets the MLflow experiment name and storage locations.
-- Run metadata is stored in `experiments/mlflow.db` (SQLite) and models in `experiments/mlartifacts/`; both are git-ignored.
-
-```
-pip install mlflow
-python experiments/track_experiments.py
-mlflow ui --backend-store-uri sqlite:///experiments/mlflow.db   # then open http://localhost:5000
-```
-
-The six default runs (learning rate, tree size and regularization variations) all land within 0.004 of each other on test ROC AUC (0.701-0.704), so the model is insensitive to these hyperparameters and the baseline config is fine.
-
-
-## Prediction API (FastAPI)
-`api/main.py` serves the trained model. It loads `pipeline/artifacts/model.joblib` once at startup (override the location with the `MODEL_PATH` environment variable), so run `python pipeline/pipeline.py` first.
-
-```
-pip install fastapi uvicorn
-uvicorn api.main:app --reload      # interactive docs at http://127.0.0.1:8000/docs
-```
-
-**`POST /predict`** takes raw flight details and applies the same feature engineering used in training (`engineer_features` in `preprocessing/preprocess.py`, shared so there is no train/serve skew):
-
-```
-curl -X POST http://127.0.0.1:8000/predict -H "Content-Type: application/json" -d '{
-  "airline_code": "DL", "flight_date": "2026-07-04",
-  "origin": "ATL", "dest": "JFK", "sched_dep_time": 1745
-}'
-```
-```
-{"predicted_delay_minutes": 7.6, "predicted_log_delay_minutes": 2.1492, "airline": "Delta Air Lines"}
-```
-
-| Field | Notes |
+## Cloud services used
+| Service | Role |
 |---|---|
-| `airline_code` | IATA code, must appear in `airlines.csv` (case-insensitive) |
-| `flight_date` | `YYYY-MM-DD` |
-| `origin`, `dest` | IATA codes from `airports.csv`; must differ |
-| `sched_dep_time` | local time as HHMM, 0-2359 (e.g. `1745`) |
-| `distance` | optional miles; estimated from airport coordinates if omitted |
+| **Google Cloud Storage** | Hosts the cleaned training and test sets (`gs://aipi50_module3_chennessey_training_data`). Preprocessing uploads them and the pipeline downloads them. |
+| **Google Cloud Build** | Builds the container image from the `Dockerfile` during `gcloud run deploy --source .`. |
+| **Google Artifact Registry** | Stores the built image (the `cloud-run-source-deploy` repository, created automatically). |
+| **Google Cloud Run** | Hosts the FastAPI service as a public HTTPS endpoint that scales to zero. |
+| **Streamlit Community Cloud** | Hosts the web front end, deployed from this GitHub repo. |
 
-Invalid or unknown inputs return HTTP 422 with an explanation. `GET /health` reports whether the model is loaded.
+## Ethics and limitations
+- **Not an airline rating.** The model learns from airline, airport, date and time. Differences between airlines partly reflect which airports and hours they serve and their hub structure, so predictions should not be read as a judgement of an airline's quality or used to rank carriers.
+- **US Domestic Flights Only** The dataset covers US domestic flights from January 2025 to August 2026, trained on a 4% sample (about 490,000 flights). Dates outside that range, international routes and brand-new airports or airlines are outside what the model has seen. Four airports in the test period never appeared in training.
+- **No Conditions Outside of Airline/Airport Considered** Weather, air-traffic programs and the inbound aircraft's status drive a large share of real delays and are not inputs, so the model gives a typical-conditions estimate, not a forecast for a particular day.
+- **Low reliability/accuracy.** The output is a rough risk estimate. It should not be relied on for decisions such as booking a tight connection.
+- **Data manipulation.** Delay minutes are heavy-tailed and over half of flights have no delay, so errors are largest on rare, very long delays. Cancelled and diverted flights are excluded, so the model says nothing about cancellation risk.
 
-The response is the model's expected delay in minutes (`expm1` of the log-scale prediction, floored at 0). It is a risk-ranking estimate, not a calibrated probability, and predictions are typically small because most flights have little or no delay.
-
-
-## Deploying the API (Docker and Google Cloud Run)
-The `Dockerfile` packages the API with the trained model baked into the image. It uses `python:3.10-slim`, installs the pinned `requirements-api.txt` (versions match the environment the model was pickled in), copies only the files the API needs, runs as a non-root user, and listens on the `PORT` that Cloud Run provides (default 8080). `.dockerignore` keeps the build context to those files.
-
-Train first, because the image copies `pipeline/artifacts/model.joblib` (git-ignored):
+## Repository layout
 ```
-python pipeline/pipeline.py
+data/            raw source CSVs (processed/ and gcs/ copies are git-ignored)
+preprocessing/   EDA, feature engineering, training set build, GCS upload
+pipeline/        config-driven training and evaluation (config.yaml)
+experiments/     MLflow experiment tracking
+api/             FastAPI backend
+frontend/        Streamlit app
+docker/          entrypoint script for the container (serve | train | preprocess | experiments)
+Dockerfile       one image for training and serving; used for the Cloud Run deployment
+requirements.txt pinned Python dependencies for the backend (the front end has its own)
+.dockerignore, .gcloudignore   what goes into the image build / the Cloud Build upload
 ```
-
-Test locally:
-```
-docker build -t airline-delay-api .
-docker run --rm -p 8080:8080 airline-delay-api
-curl http://localhost:8080/health
-```
-
-Deploy to Cloud Run (requires the `gcloud` CLI from the GCS setup above):
-```
-gcloud run deploy airline-delay-api --source . --project project-4364f816-1535-4389-aef --region us-central1 --memory 1Gi
-```
-`--source .` builds the image with Cloud Build using `.gcloudignore`, which mirrors `.dockerignore` so the model file is included even though git ignores it. Add `--allow-unauthenticated` only if the API should be publicly callable. Otherwise callers need an identity token. To retrain and redeploy, re-run the pipeline and the deploy command.
-
-
-## Front End (Streamlit)
-`frontend/app.py` is a one-page form that calls the deployed API (`POST /predict`). The user picks an airline, origin airport, destination airport, flight date and scheduled departure time, and the page shows the predicted delay in minutes. It also validates that origin and destination differ and shows the API's error message if a call fails.
-
-It is self-contained: `frontend/airports.csv` and `frontend/airlines.csv` hold the dropdown options (copied from `data/`), and `frontend/requirements.txt` lists its dependencies.
-
-Run locally from the repo root:
-```
-pip install -r frontend/requirements.txt
-streamlit run frontend/app.py
-```
-
-The API URL defaults to the Cloud Run service (`https://airline-delay-api-170279949235.us-east1.run.app`). To point at a different backend (for example `http://localhost:8080`), set `API_URL` in `.streamlit/secrets.toml` locally (git-ignored) or in the app's **Secrets** settings on Streamlit Community Cloud:
-```
-API_URL = "https://your-service-url"
-```
-
-**Deploying on Streamlit Community Cloud:** push the repo to GitHub, then at https://share.streamlit.io choose **Create app**, select the repo and branch, set the main file path to `frontend/app.py`, and deploy. Streamlit installs `frontend/requirements.txt` automatically. The Cloud Run service must allow unauthenticated requests, since the front end calls it without credentials. The first request after the API has been idle can take a few seconds while Cloud Run starts a container.
+## AI Use Disclaimer:
+The choice of dataset, planning of the pipeline, all architectural decisions and cloud configuration were carried out without AI-assistance. The code implementation was generated using Claude Code (Opus 5.5) and manually reviewed.
